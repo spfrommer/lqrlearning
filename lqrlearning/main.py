@@ -60,9 +60,9 @@ def make_system(state_n, input_n):
     return System(A, B, Q, R, W)
 
 def simulate(system: System, policy, x0: Tensor, timesteps: int):
-    xs = torch.zeros(timesteps + 1, system.state_n())
-    us = torch.zeros(timesteps, system.input_n())
-    ws = torch.zeros(timesteps, system.state_n())
+    xs = [x0]
+    us = []
+    ws = []
 
     xs[0] = x0
 
@@ -71,11 +71,11 @@ def simulate(system: System, policy, x0: Tensor, timesteps: int):
         u = policy(x)
         w = dists.MultivariateNormal(torch.zeros(system.state_n()), system.W).sample()
 
-        xs[t+1] = system.A @ x + system.B @ u + w
-        us[t] = u
-        ws[t] = w
+        xs.append(system.A @ x + system.B @ u + w)
+        us.append(u)
+        ws.append(w)
 
-    return Trajectory(xs, us, ws)
+    return Trajectory(torch.stack(xs, dim=0), torch.stack(us, dim=0), torch.stack(ws, dim=0))
 
 def cost(system: System, trajectory: Trajectory):
     total_cost = sum([x @ system.Q @ x + u @ system.R @ u
@@ -112,9 +112,17 @@ class LQRModel(nn.Module):
         self.system = system
 
     def forward(self, x):
-        A, B, R, theta = self.system.A, self.system.B, self.system.R, self.system.theta
+        A, B, R, theta = self.system.A, self.system.B, self.system.R, self.theta
 
-        return -(R + B.t() @ theta.t() @ theta @ B).inverse() @ B.t() @ theta.T() @ theta @ A
+        # inner = R + B.t() @ theta @ B
+        # inner = inner.inverse()
+        # K = -inner @ B.t() @ theta @ A
+
+        inner = R + B.t() @ theta.t() @ theta @ B
+        inner = inner.inverse()
+        K = -inner @ B.t() @ theta.t() @ theta @ A
+
+        return K @ x
 
 def learned_policy(system: System):
     model = LQRModel(system)
@@ -122,13 +130,23 @@ def learned_policy(system: System):
     return lambda x: model(x)
 
 def train_policy(system: System, policy, timesteps: int, epochs):
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.001, momentum=0.9)
+    torch.autograd.set_detect_anomaly(True)
+    K = 10
+
     for _ in range(epochs):
         trajectories = []
-        for _ in range(10):
-            x0 = torch.normal(mean=0.0, std=1.0, size=(state_n))
+        for _ in range(K):
+            x0 = torch.normal(mean=0.0, std=1.0, size=(system.state_n(),))
             trajectories.append(simulate(system, policy, x0, timesteps))
 
+        cum_cost = (1 / K) * sum([cost(system, trajectory) for trajectory in trajectories])
 
+        optimizer.zero_grad()
+        cum_cost.backward()
+        optimizer.step()
+
+        print(cum_cost)
 
 
 @click.command()
@@ -142,15 +160,15 @@ def run(epochs, state_n, input_n, timesteps):
 
     pretty.section_print('Making system')
 
-    x0 = torch.ones(state_n)
     system = make_system(state_n, input_n)
-    policy = lqr_policy(system)
-    trajectory = simulate(system, policy, x0, timesteps)
+    policy = LQRModel(system)
+    train_policy(system, policy, 100, epochs)
 
-    print(trajectory.xs)
-    print(cost(system, trajectory))
-
-
+    # x0 = torch.ones(state_n)
+    # policy = lqr_policy(system)
+    # trajectory = simulate(system, policy, x0, timesteps)
+    # print(trajectory.xs)
+    # print(cost(system, trajectory))
 
 if __name__ == "__main__":
     run()
