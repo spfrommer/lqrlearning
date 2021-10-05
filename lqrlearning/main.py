@@ -6,9 +6,7 @@ from torch.utils.tensorboard import SummaryWriter
 import control
 
 import click
-import socket
-import threading
-import os
+import random
 import numpy as np
 import matplotlib.pyplot as plt
 import colorama
@@ -18,6 +16,8 @@ from dataclasses import dataclass
 from lqrlearning.utils import dirs, file_utils, pretty, torch_utils
 
 import pdb
+
+torch.manual_seed(0)
 
 torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
@@ -60,6 +60,8 @@ def make_system(state_n, input_n):
     return System(A, B, Q, R, W)
 
 def simulate(system: System, policy, x0: Tensor, timesteps: int):
+    wdist = dists.MultivariateNormal(torch.zeros(system.state_n()), system.W)
+
     xs = [x0]
     us = []
     ws = []
@@ -67,9 +69,10 @@ def simulate(system: System, policy, x0: Tensor, timesteps: int):
     xs[0] = x0
 
     for t in range(timesteps):
-        x = xs[t]
+        x = xs[t].detach()
+        # x = xs[t]
         u = policy(x)
-        w = dists.MultivariateNormal(torch.zeros(system.state_n()), system.W).sample()
+        w = wdist.sample()
 
         xs.append(system.A @ x + system.B @ u + w)
         us.append(u)
@@ -108,19 +111,19 @@ def lqr_policy(system):
 class LQRModel(nn.Module):
     def __init__(self, system: System):
         super().__init__()
-        self.theta = nn.Parameter(torch.eye(system.state_n()), requires_grad=True)
+        # self.theta = nn.Parameter(0.1 * torch.ones(system.state_n(), system.state_n()), requires_grad=True)
+        init_theta = torch.eye(system.state_n())
+        init_theta[0,2] = 0.5
+        init_theta[3,2] = 2.5
+        init_theta[1,0] = 8.0
+        self.theta = nn.Parameter(init_theta, requires_grad=True)
         self.system = system
 
     def forward(self, x):
         A, B, R, theta = self.system.A, self.system.B, self.system.R, self.theta
 
-        # inner = R + B.t() @ theta @ B
-        # inner = inner.inverse()
-        # K = -inner @ B.t() @ theta @ A
-
         inner = R + B.t() @ theta.t() @ theta @ B
-        inner = inner.inverse()
-        K = -inner @ B.t() @ theta.t() @ theta @ A
+        K = -inner.inverse() @ B.t() @ theta.t() @ theta @ A
 
         return K @ x
 
@@ -129,24 +132,33 @@ def learned_policy(system: System):
 
     return lambda x: model(x)
 
-def train_policy(system: System, policy, timesteps: int, epochs):
-    optimizer = torch.optim.SGD(policy.parameters(), lr=0.001, momentum=0.9)
-    torch.autograd.set_detect_anomaly(True)
+def train_policy(system: System, policy, optimal_policy, timesteps: int, epochs):
+    optimizer = torch.optim.SGD(policy.parameters(), lr=0.5)
     K = 10
 
-    for _ in range(epochs):
+    file_utils.create_empty_directory(dirs.out_path('tensorboard'))
+    writer = SummaryWriter(dirs.out_path('tensorboard'))
+
+    for epoch in range(epochs):
+
         trajectories = []
+        trajectories_optimal = []
         for _ in range(K):
             x0 = torch.normal(mean=0.0, std=1.0, size=(system.state_n(),))
+            # x0 = torch.ones(system.state_n())
             trajectories.append(simulate(system, policy, x0, timesteps))
+            trajectories_optimal.append(simulate(system, optimal_policy, x0, timesteps))
 
-        cum_cost = (1 / K) * sum([cost(system, trajectory) for trajectory in trajectories])
 
-        optimizer.zero_grad()
+        cum_cost = (1 / K) * sum([cost(system, traj) for traj in trajectories])
         cum_cost.backward()
         optimizer.step()
 
+        optimal_cost = (1 / K) * sum([cost(system, traj) for traj in trajectories_optimal])
+
+        writer.add_scalars('Loss/train', {'learned': cum_cost, 'optimal': optimal_cost}, epoch)
         print(cum_cost)
+        print(policy.theta)
 
 
 @click.command()
@@ -156,16 +168,17 @@ def train_policy(system: System, policy, timesteps: int, epochs):
 @click.option('--timesteps', default=100)
 def run(epochs, state_n, input_n, timesteps):
     colorama.init()
-    # torch_utils.launch_tensorboard(dirs.out_path('tensorboard'), 6006)
+    torch_utils.launch_tensorboard(dirs.out_path('tensorboard'), 6006)
 
     pretty.section_print('Making system')
 
     system = make_system(state_n, input_n)
+
     policy = LQRModel(system)
-    train_policy(system, policy, 100, epochs)
+    optimal_policy = lqr_policy(system)
+    train_policy(system, policy, optimal_policy, timesteps, epochs)
 
     # x0 = torch.ones(state_n)
-    # policy = lqr_policy(system)
     # trajectory = simulate(system, policy, x0, timesteps)
     # print(trajectory.xs)
     # print(cost(system, trajectory))
